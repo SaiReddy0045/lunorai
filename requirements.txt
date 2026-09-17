@@ -1,0 +1,25 @@
+# LunorAI – Intelligent Knowledge Assistant Dependencies
+# Compatible with Python 3.10 - 3.12
+
+# Core Web Interface
+streamlit>=1.40.0
+
+# LangChain Ecosystem & Workflows
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+langchain-text-splitters>=0.3.0
+langchain-ollama>=0.2.0
+langgraph>=0.2.0
+
+# Vector Store
+faiss-cpu>=1.9.0
+
+# Document Ingestion & PDF Parsing
+pymupdf>=1.24.0
+pypdf>=5.0.0
+
+# Utilities & Networking
+python-dotenv>=1.0.0
+requests>=2.31.0
+pydantic>=2.7.0
