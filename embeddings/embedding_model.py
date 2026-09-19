@@ -5,6 +5,7 @@ with configurable fallback support.
 """
 
 import logging
+from functools import lru_cache
 from typing import Optional
 from langchain_core.embeddings import Embeddings
 from langchain_ollama import OllamaEmbeddings
@@ -13,6 +14,19 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 
+def _embedding_keep_alive_seconds() -> int:
+    value = settings.OLLAMA_KEEP_ALIVE
+    if isinstance(value, int):
+        return value
+    value = str(value).strip().lower()
+    if value.endswith("m"):
+        return int(float(value[:-1]) * 60)
+    if value.endswith("h"):
+        return int(float(value[:-1]) * 3600)
+    return int(float(value))
+
+
+@lru_cache(maxsize=8)
 def get_embedding_model(
     provider: Optional[str] = None,
     model_name: Optional[str] = None,
@@ -29,6 +43,7 @@ def get_embedding_model(
         return OllamaEmbeddings(
             model=model,
             base_url=settings.OLLAMA_BASE_URL,
+            keep_alive=_embedding_keep_alive_seconds(),
         )
 
     elif prov == "huggingface":
@@ -47,4 +62,5 @@ def get_embedding_model(
         return OllamaEmbeddings(
             model=model,
             base_url=settings.OLLAMA_BASE_URL,
+            keep_alive=_embedding_keep_alive_seconds(),
         )

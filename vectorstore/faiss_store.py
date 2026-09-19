@@ -5,8 +5,9 @@ and similarity search with relevance scoring.
 """
 
 import logging
+import time
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_community.vectorstores import FAISS
@@ -65,6 +66,7 @@ class FAISSStore:
         query: str,
         k: Optional[int] = None,
         score_threshold: Optional[float] = None,
+        timings: Optional[Dict[str, float]] = None,
     ) -> List[Tuple[Document, float]]:
         """
         Performs similarity search with relevance scores.
@@ -75,23 +77,25 @@ class FAISSStore:
             return []
 
         top_k = k or settings.TOP_K_RETRIEVAL
-        threshold = score_threshold if score_threshold is not None else settings.RELEVANCE_SCORE_THRESHOLD
-
         try:
-            # LangChain FAISS similarity_search_with_relevance_scores returns scores in [0, 1]
-            scored_docs = self.vector_store.similarity_search_with_relevance_scores(
-                query, k=top_k, score_threshold=threshold
+            # Embed once, then pass the vector directly to LangChain's FAISS
+            # implementation so embedding and index-search timings are distinct.
+            started = time.perf_counter()
+            query_embedding = self.embeddings.embed_query(query)
+            if timings is not None:
+                timings["query_embedding_ms"] = (time.perf_counter() - started) * 1000
+
+            started = time.perf_counter()
+            raw_docs = self.vector_store.similarity_search_with_score_by_vector(
+                query_embedding, k=top_k
             )
-            return scored_docs
+            if timings is not None:
+                timings["faiss_search_ms"] = (time.perf_counter() - started) * 1000
+
+            return [(doc, 1.0 / (1.0 + float(distance))) for doc, distance in raw_docs]
         except Exception as e:
-            logger.warning(f"Relevance scores search fallback to standard distance: {e}")
-            # Fallback to standard similarity_search_with_score (L2 distance)
-            raw_docs = self.vector_store.similarity_search_with_score(query, k=top_k)
-            # Normalize L2 distance to an approximate relevance score: 1 / (1 + dist)
-            normalized = [(doc, 1.0 / (1.0 + float(dist))) for doc, dist in raw_docs]
-            if threshold is not None:
-                normalized = [(d, s) for d, s in normalized if s >= threshold]
-            return normalized
+            logger.warning(f"FAISS similarity search failed: {e}")
+            return []
 
     def as_retriever(self, k: Optional[int] = None):
         """

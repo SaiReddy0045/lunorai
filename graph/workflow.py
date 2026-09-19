@@ -1,10 +1,11 @@
 """
 LunorAI - LangGraph RAG Workflow Orchestrator
-Builds and compiles the stateful RAG workflow graph:
-START -> retrieve_documents -> check_relevance -> generate_answer -> format_sources -> END
+    Builds and compiles the stateful RAG workflow graph:
+    START -> retrieve_documents -> check_relevance -> generate_answer -> format_sources -> END
 """
 
 import logging
+import time
 from typing import Callable, Dict, Any, List, Optional
 from langgraph.graph import StateGraph, START, END
 from langchain_core.documents import Document
@@ -17,6 +18,23 @@ from llm.ollama_model import get_llm
 from utils.helpers import deduplicate_sources
 
 logger = logging.getLogger(__name__)
+
+
+def _format_timings(timings: Dict[str, float]) -> str:
+    labels = (
+        "query_embedding_ms",
+        "faiss_search_ms",
+        "context_preparation_ms",
+        "prompt_construction_ms",
+        "ollama_generation_ms",
+        "source_formatting_ms",
+        "total_response_ms",
+    )
+    return ", ".join(
+        f"{label}={timings[label]:.1f}"
+        for label in labels
+        if label in timings
+    )
 
 
 def load_prompt_template() -> str:
@@ -54,16 +72,20 @@ def create_rag_graph(
     # 1. Node: retrieve_documents
     # -------------------------------------------------------------
     def retrieve_documents(state: RAGState) -> Dict[str, Any]:
+        total_started = time.perf_counter()
+        timings = dict(state.get("timings", {}))
+        timings["_total_started"] = total_started
         question = state.get("question", "").strip()
         logger.info(f"[Graph] retrieve_documents for: '{question}'")
 
         if not question:
-            return {"documents": [], "relevance_scores": []}
+            timings["total_response_ms"] = (time.perf_counter() - total_started) * 1000
+            return {"documents": [], "relevance_scores": [], "timings": timings}
 
         scored_docs = faiss_store.similarity_search_with_scores(
             query=question,
             k=settings.TOP_K_RETRIEVAL,
-            score_threshold=settings.RELEVANCE_SCORE_THRESHOLD,
+            timings=timings,
         )
 
         docs: List[Document] = [doc for doc, _ in scored_docs]
@@ -73,6 +95,7 @@ def create_rag_graph(
         return {
             "documents": docs,
             "relevance_scores": scores,
+            "timings": timings,
         }
 
     # -------------------------------------------------------------
@@ -80,7 +103,6 @@ def create_rag_graph(
     # -------------------------------------------------------------
     def check_relevance(state: RAGState) -> Dict[str, Any]:
         docs = state.get("documents", [])
-        scores = state.get("relevance_scores", [])
 
         # Check if we have documents and non-empty content
         if not docs:
@@ -99,20 +121,35 @@ def create_rag_graph(
     # 3. Node: generate_answer (for relevant context)
     # -------------------------------------------------------------
     def generate_answer(state: RAGState) -> Dict[str, Any]:
+        timings = dict(state.get("timings", {}))
         question = state.get("question", "")
         docs = state.get("documents", [])
 
-        formatted_context = "\n\n".join(
-            f"[Source: {d.metadata.get('source', 'Doc')}, Page: {d.metadata.get('page', 1)}]\n{d.page_content}"
-            for d in docs
-        )
+        started = time.perf_counter()
+        context_parts = []
+        context_length = 0
+        for document in docs[: settings.TOP_K_RETRIEVAL]:
+            context_part = (
+                f"[Source: {document.metadata.get('source', 'Doc')}, "
+                f"Page: {document.metadata.get('page', 1)}]\n{document.page_content}"
+            )
+            remaining = settings.MAX_CONTEXT_CHARS - context_length
+            if remaining <= 0:
+                break
+            context_parts.append(context_part[:remaining])
+            context_length += len(context_parts[-1])
+        formatted_context = "\n\n".join(context_parts)
+        timings["context_preparation_ms"] = (time.perf_counter() - started) * 1000
 
+        started = time.perf_counter()
         formatted_prompt = prompt_template.format(
             context=formatted_context,
             question=question,
         )
+        timings["prompt_construction_ms"] = (time.perf_counter() - started) * 1000
 
         try:
+            started = time.perf_counter()
             if token_callback is None:
                 response = llm.invoke(formatted_prompt)
                 answer_text = response.content if hasattr(response, "content") else str(response)
@@ -124,6 +161,7 @@ def create_rag_graph(
                         answer_parts.append(content)
                         token_callback(content)
                 answer_text = "".join(answer_parts)
+            timings["ollama_generation_ms"] = (time.perf_counter() - started) * 1000
         except Exception as e:
             logger.error(f"[Graph] LLM invocation failed: {e}")
             answer_text = (
@@ -131,7 +169,7 @@ def create_rag_graph(
                 f"Please ensure Ollama is running with model '{settings.OLLAMA_MODEL}'."
             )
 
-        return {"answer": answer_text}
+        return {"answer": answer_text, "timings": timings}
 
     # -------------------------------------------------------------
     # 4. Node: fallback_unsupported (when context is insufficient)
@@ -148,6 +186,8 @@ def create_rag_graph(
     # 5. Node: format_sources
     # -------------------------------------------------------------
     def format_sources(state: RAGState) -> Dict[str, Any]:
+        started = time.perf_counter()
+        timings = dict(state.get("timings", {}))
         is_relevant = state.get("is_relevant", False)
         docs = state.get("documents", [])
         answer = state.get("answer", "").lower()
@@ -160,11 +200,21 @@ def create_rag_graph(
             or "information was not found" in answer
             or "not found in the uploaded document" in answer
         ):
-            return {"sources": []}
+            timings["source_formatting_ms"] = (time.perf_counter() - started) * 1000
+            timings["total_response_ms"] = (
+                time.perf_counter() - timings.get("_total_started", time.perf_counter())
+            ) * 1000
+            logger.info("[Timing] %s", _format_timings(timings))
+            return {"sources": [], "timings": timings}
 
         citations = deduplicate_sources(docs)
         logger.info(f"[Graph] format_sources: Formatted {len(citations)} unique citations.")
-        return {"sources": citations}
+        timings["source_formatting_ms"] = (time.perf_counter() - started) * 1000
+        timings["total_response_ms"] = (
+            time.perf_counter() - timings.get("_total_started", time.perf_counter())
+        ) * 1000
+        logger.info("[Timing] %s", _format_timings(timings))
+        return {"sources": citations, "timings": timings}
 
     # -------------------------------------------------------------
     # Routing logic

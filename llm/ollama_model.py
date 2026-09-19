@@ -4,6 +4,7 @@ Initializes ChatOllama with configured parameters and provides connectivity diag
 """
 
 import logging
+from functools import lru_cache
 from typing import Optional, Tuple
 import requests
 from langchain_ollama import ChatOllama
@@ -40,6 +41,7 @@ def check_ollama_status() -> Tuple[bool, str]:
         return False, f"Ollama check failed: {str(e)}"
 
 
+@lru_cache(maxsize=8)
 def get_llm(
     model: Optional[str] = None,
     temperature: Optional[float] = None,

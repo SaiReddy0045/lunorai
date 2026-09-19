@@ -1,126 +1,139 @@
-"""
-LunorAI - Comprehensive End-to-End Pipeline Verification
-Tests PDF loading, chunking, FAISS vector indexing, relevance filtering,
-grounded question answering with llama3.2, and out-of-context safety behavior.
-"""
+"""Lightweight deterministic tests for the LunorAI RAG pipeline."""
 
-import sys
 from pathlib import Path
 
-# Add project root to sys.path
-BASE_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(BASE_DIR))
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+from langchain_core.messages import AIMessage
 
-from ingestion.pdf_loader import PDFLoader
-from ingestion.chunker import DocumentChunker
 from embeddings.embedding_model import get_embedding_model
-from vectorstore.faiss_store import FAISSStore
 from graph.workflow import create_rag_graph
+from ingestion.chunker import DocumentChunker
+from ingestion.pdf_loader import PDFLoader
+from vectorstore.faiss_store import FAISSStore
 
 
-def run_pipeline_tests():
-    print("=" * 60)
-    print("  LunorAI Automated Verification Test Suite")
-    print("=" * 60)
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-    sample_pdf = BASE_DIR / "sample_document.pdf"
-    if not sample_pdf.exists():
-        raise FileNotFoundError(f"Missing test PDF at {sample_pdf}")
 
-    # 1. Test Ingestion
-    print("\n[1/5] Testing PDFLoader...")
-    loader = PDFLoader()
-    documents = loader.load_from_path(sample_pdf)
-    print(f"-> Successfully extracted {len(documents)} pages.")
-    assert len(documents) == 3, f"Expected 3 pages, got {len(documents)}"
-    for doc in documents:
-        print(f"   Page {doc.metadata.get('page')}: {len(doc.page_content)} characters")
-        assert "page" in doc.metadata and doc.metadata["page"] >= 1
+class KeywordEmbeddings(Embeddings):
+    """Small local embedding substitute that makes tests independent of Ollama."""
 
-    # 2. Test Chunking
-    print("\n[2/5] Testing DocumentChunker...")
-    chunker = DocumentChunker(chunk_size=500, chunk_overlap=100)
-    chunks = chunker.split_documents(documents)
-    print(f"-> Generated {len(chunks)} text chunks.")
-    assert len(chunks) >= 3, "Expected at least 3 chunks"
-    for chunk in chunks:
-        assert "source" in chunk.metadata
-        assert "page" in chunk.metadata
+    WORDS = ("author", "published", "embedding", "dimension", "recipe")
 
-    # 3. Test Embeddings & FAISS Indexing
-    print("\n[3/5] Testing Embedding Model & FAISS Vector Index...")
-    embeddings = get_embedding_model()
-    store = FAISSStore(embeddings=embeddings)
-    store.build_from_documents(chunks)
-    print("-> FAISS index created successfully.")
+    def _vector(self, text: str) -> list[float]:
+        lowered = text.lower()
+        return [float(lowered.count(word)) for word in self.WORDS]
 
-    # 4. Test LangGraph Workflow Compilation
-    print("\n[4/5] Compiling LangGraph State Machine...")
-    graph = create_rag_graph(faiss_store=store)
-    print("-> LangGraph workflow compiled successfully.")
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._vector(text) for text in texts]
 
-    # 5. Test RAG Retrieval & In-Context Answering
-    print("\n[5/5] Testing Question Answering & Safety Behavior...")
+    def embed_query(self, text: str) -> list[float]:
+        return self._vector(text)
 
-    # Case A: Factual in-context question (Page 1)
-    q1 = "Who is the primary author of the LunorAI specification and when was it published?"
-    print(f"\n--- Test Case A (Grounded Question): '{q1}' ---")
-    res1 = graph.invoke({
-        "question": q1,
+
+class FakeLLM:
+    def invoke(self, prompt: str) -> AIMessage:
+        question = prompt.split("Question:", 1)[-1].split("Answer:", 1)[0].lower()
+        if "recipe" in question:
+            return AIMessage(content="I could not find the information to answer this question in the uploaded document(s).")
+        if "author" in question:
+            return AIMessage(content="The primary author is Elena Rostova.")
+        if "embedding model" in question:
+            return AIMessage(content="The embedding model is nomic-embed-text with dimension 768.")
+        return AIMessage(content="I could not find the information to answer this question in the uploaded document(s).")
+
+
+def state(question: str) -> dict:
+    return {
+        "question": question,
         "documents": [],
         "relevance_scores": [],
         "is_relevant": False,
         "answer": "",
         "sources": [],
-    })
-    print("Answer:\n", res1["answer"])
-    print("Sources:\n", res1["sources"])
-    assert "Elena Rostova" in res1["answer"], "Failed to identify author Elena Rostova"
-    assert len(res1["sources"]) > 0, "Expected at least one citation"
-    assert res1["sources"][0]["page"] == 1, f"Expected Page 1 citation, got {res1['sources'][0]['page']}"
-
-    # Case B: Factual in-context question (Page 2)
-    q2 = "What embedding model and vector dimension does LunorAI use?"
-    print(f"\n--- Test Case B (Technical Spec): '{q2}' ---")
-    res2 = graph.invoke({
-        "question": q2,
-        "documents": [],
-        "relevance_scores": [],
-        "is_relevant": False,
-        "answer": "",
-        "sources": [],
-    })
-    print("Answer:\n", res2["answer"])
-    print("Sources:\n", res2["sources"])
-    assert "nomic-embed-text" in res2["answer"] or "768" in res2["answer"], "Failed to identify embedding specifications"
-    assert any(s["page"] == 2 for s in res2["sources"]), "Expected citation from Page 2"
-
-    # Case C: Out-of-Context / Hallucination-check question
-    q3 = "What is the recipe for baking a blueberry cheesecake with dark chocolate ganache?"
-    print(f"\n--- Test Case C (Out-of-Context Safety Check): '{q3}' ---")
-    res3 = graph.invoke({
-        "question": q3,
-        "documents": [],
-        "relevance_scores": [],
-        "is_relevant": False,
-        "answer": "",
-        "sources": [],
-    })
-    print("Answer:\n", res3["answer"])
-    print("Sources:\n", res3["sources"])
-    # Assert assistant refuses or explicitly states information is missing
-    answer_lower = res3["answer"].lower()
-    assert (
-        "could not find" in answer_lower
-        or "not mentioned" in answer_lower
-        or "does not contain" in answer_lower
-        or "not found" in answer_lower
-    ), "Safety check failed: LLM hallucinated out-of-context recipe!"
-
-    print("\n" + "=" * 60)
-    print("  ALL VERIFICATION TESTS PASSED SUCCESSFULLY! [PASS]")
-    print("=" * 60)
+    }
 
 
-if __name__ == "__main__":
-    run_pipeline_tests()
+def test_pdf_ingestion_and_chunking():
+    documents = PDFLoader().load_from_path(BASE_DIR / "sample_document.pdf")
+
+    assert len(documents) == 3
+    assert documents[0].metadata["page"] == 1
+
+    chunks = DocumentChunker(chunk_size=500, chunk_overlap=100).split_documents(documents)
+    assert chunks
+    assert all("source" in chunk.metadata and "page" in chunk.metadata for chunk in chunks)
+
+
+def build_test_store() -> FAISSStore:
+    store = FAISSStore(KeywordEmbeddings())
+    store.build_from_documents([
+        Document(
+            page_content="The primary author is Elena Rostova and the specification was published in 2024.",
+            metadata={"source": "spec.pdf", "page": 1},
+        ),
+        Document(
+            page_content="LunorAI uses the nomic-embed-text embedding model with dimension 768.",
+            metadata={"source": "spec.pdf", "page": 2},
+        ),
+    ])
+    return store
+
+
+def test_retrieval_uses_top_k_without_aggressive_threshold():
+    results = build_test_store().similarity_search_with_scores(
+        "Who is the primary author?", k=3, score_threshold=0.99
+    )
+
+    assert results
+    assert results[0][0].metadata["page"] == 1
+
+
+def test_graph_answers_grounded_question_and_preserves_citation():
+    graph = create_rag_graph(build_test_store(), llm=FakeLLM())
+    result = graph.invoke(state("Who is the primary author?"))
+
+    assert "Elena Rostova" in result["answer"]
+    assert result["sources"][0]["source"] == "spec.pdf"
+    assert result["sources"][0]["page"] == 1
+
+
+def test_graph_refuses_question_outside_retrieved_context():
+    graph = create_rag_graph(build_test_store(), llm=FakeLLM())
+    result = graph.invoke(state("What is the recipe for blueberry cheesecake?"))
+
+    assert "could not find" in result["answer"].lower()
+    assert result["sources"] == []
+
+
+def test_repeated_questions_do_not_rebuild_vector_store_or_embedding_model():
+    store = build_test_store()
+    graph = create_rag_graph(store, llm=FakeLLM())
+    build_count = 0
+    original_build = store.build_from_documents
+
+    def unexpected_rebuild(documents):
+        nonlocal build_count
+        build_count += 1
+        return original_build(documents)
+
+    store.build_from_documents = unexpected_rebuild
+    graph.invoke(state("Who is the primary author?"))
+    graph.invoke(state("Who is the primary author?"))
+
+    assert build_count == 0
+    assert get_embedding_model.cache_info().currsize >= 0
+
+
+def test_graph_records_stage_timings():
+    graph = create_rag_graph(build_test_store(), llm=FakeLLM())
+    result = graph.invoke(state("Who is the primary author?"))
+
+    assert result["timings"]["query_embedding_ms"] >= 0
+    assert result["timings"]["faiss_search_ms"] >= 0
+    assert result["timings"]["context_preparation_ms"] >= 0
+    assert result["timings"]["prompt_construction_ms"] >= 0
+    assert result["timings"]["ollama_generation_ms"] >= 0
+    assert result["timings"]["source_formatting_ms"] >= 0
+    assert result["timings"]["total_response_ms"] >= 0

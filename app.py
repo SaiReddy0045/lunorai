@@ -4,7 +4,6 @@ A production-grade, modular RAG web application built with Streamlit,
 LangChain, LangGraph, FAISS, and Ollama.
 """
 
-import os
 import sys
 from pathlib import Path
 
